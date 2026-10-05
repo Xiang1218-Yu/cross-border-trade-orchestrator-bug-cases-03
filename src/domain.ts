@@ -8,7 +8,7 @@ export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 type Tenant = { id: string; name: string; creditLimit: number; creditUsed: number; currency: string };
 type Customer = { id: string; tenantId: string; name: string; creditLimit: number; creditUsed: number; blocked: boolean; timezone?: string };
 type OrderItem = { sku: string; description: string; quantity: number; unitPrice: number; weightKg: number; hsCode: string };
-export type Order = { id: string; tenantId: string; customerId: string; reference: string; origin: string; destination: string; priority: 'standard' | 'urgent' | 'critical'; status: OrderStatus; items: OrderItem[]; totalWeightKg: number; subtotal: number; totalAmount: number; currency: string; version: number; shipmentId?: string; customsDeclarationId?: string; invoiceId?: string; createdAt: string; updatedAt: string };
+export type Order = { id: string; tenantId: string; customerId: string; reference: string; origin: string; destination: string; priority: 'standard' | 'urgent' | 'critical'; status: OrderStatus; items: OrderItem[]; totalWeightKg: number; subtotal: number; totalAmount: number; currency: string; version: number; shipmentId?: string; customsDeclarationId?: string; invoiceId?: string; lastEventAt?: string; createdAt: string; updatedAt: string };
 type InventoryLot = { id: string; tenantId: string; warehouse: string; sku: string; available: number; reserved: number; lotCode: string; expiresAt?: string };
 type Reservation = { id: string; tenantId: string; orderId: string; lotId: string; sku: string; quantity: number; status: 'active' | 'released' | 'consumed'; createdAt: string };
 type ShipmentLeg = { id: string; mode: 'truck' | 'rail' | 'sea' | 'air'; origin: string; destination: string; plannedDeparture: string; plannedArrival: string; actualArrival?: string; status: 'planned' | 'in_transit' | 'arrived' | 'delayed' };
@@ -20,8 +20,13 @@ type Payment = { id: string; tenantId: string; invoiceId: string; amount: number
 type Approval = { id: string; tenantId: string; orderId: string; type: 'credit_override' | 'customs_exception' | 'delay_compensation'; reason: string; status: ApprovalStatus; decidedBy?: string; comment?: string; createdAt: string; decidedAt?: string };
 export type AuditEvent = { id: string; tenantId: string; actor: string; action: string; entityType: string; entityId: string; before?: unknown; after?: unknown; at: string };
 export type OutboxEvent = { id: string; tenantId: string; topic: string; aggregateId: string; payload: unknown; status: 'pending' | 'published'; attempts: number; createdAt: string };
+export type IngestEventCode = 'DISPATCHED' | 'IN_TRANSIT' | 'ARRIVED' | 'DELAYED' | 'DELIVERED' | 'DELIVERED_EXCEPTION' | 'CANCELLED';
+export type IngestEventInput = { eventId: string; orderId?: string; trackingNo?: string; code: IngestEventCode; occurredAt: string; source?: 'device' | 'carrier' | 'manual'; location?: string; note?: string };
+export type IngestResultStatus = 'applied' | 'duplicate' | 'ignored' | 'conflict' | 'rejected';
+export type IngestResult = { eventId: string; status: IngestResultStatus; reason: string; order: Order };
+export type ProcessedEvent = { id: string; tenantId: string; eventId: string; orderId: string; code: IngestEventCode; occurredAt: string; receivedAt: string; status: IngestResultStatus; reason: string };
 
-type State = { tenants: Tenant[]; customers: Customer[]; orders: Order[]; inventory: InventoryLot[]; reservations: Reservation[]; shipments: Shipment[]; customs: CustomsDeclaration[]; invoices: Invoice[]; payments: Payment[]; approvals: Approval[]; audit: AuditEvent[]; outbox: OutboxEvent[] };
+type State = { tenants: Tenant[]; customers: Customer[]; orders: Order[]; inventory: InventoryLot[]; reservations: Reservation[]; shipments: Shipment[]; customs: CustomsDeclaration[]; invoices: Invoice[]; payments: Payment[]; approvals: Approval[]; audit: AuditEvent[]; outbox: OutboxEvent[]; processedEvents: ProcessedEvent[] };
 const now = () => new Date().toISOString();
 const clone = <T>(value: T): T => structuredClone(value);
 const id = (prefix: string) => `${prefix}-${randomUUID().slice(0, 8).toUpperCase()}`;
@@ -34,7 +39,7 @@ export const state: State = {
     { id: 'LOT-001', tenantId: 'tenant-acme', warehouse: 'SHANGHAI-FTZ', sku: 'SENSOR-X9', available: 80, reserved: 10, lotCode: 'SX9-2608' },
     { id: 'LOT-002', tenantId: 'tenant-acme', warehouse: 'SHANGHAI-FTZ', sku: 'CONTROL-M2', available: 36, reserved: 4, lotCode: 'CM2-2607' },
     { id: 'LOT-003', tenantId: 'tenant-acme', warehouse: 'ROTTERDAM-DC', sku: 'SENSOR-X9', available: 12, reserved: 0, lotCode: 'SX9-2606' }
-  ], reservations: [], shipments: [], customs: [], invoices: [], payments: [], approvals: [], audit: [], outbox: []
+  ], reservations: [], shipments: [], customs: [], invoices: [], payments: [], approvals: [], audit: [], outbox: [], processedEvents: []
 };
 
 function tenant(id: string) { const value = state.tenants.find(item => item.id === id); if (!value) throw new Error('租户不存在'); return value; }
@@ -44,7 +49,11 @@ function orderFor(tenantId: string, orderId: string) { const order = state.order
 function record(tenantId: string, actor: string, action: string, entityType: string, entityId: string, before?: unknown, after?: unknown) { state.audit.unshift({ id: id('AUD'), tenantId, actor, action, entityType, entityId, before: before === undefined ? undefined : clone(before), after: after === undefined ? undefined : clone(after), at: now() }); }
 function emit(tenantId: string, topic: string, aggregateId: string, payload: unknown) { state.outbox.unshift({ id: id('EVT'), tenantId, topic, aggregateId, payload: clone(payload), status: 'pending', attempts: 0, createdAt: now() }); }
 function mutate(tenantId: string, actor: string, action: string, type: string, entityId: string, before: unknown, after: unknown, topic: string) { record(tenantId, actor, action, type, entityId, before, after); if (action !== 'order.confirmed') emit(tenantId, topic, entityId, after); }
-function transition(order: Order, next: OrderStatus) { const allowed: Record<OrderStatus, OrderStatus[]> = { draft: ['confirmed', 'cancelled'], confirmed: ['allocated', 'cancelled'], allocated: ['dispatched', 'cancelled'], dispatched: ['delivered'], delivered: ['closed', 'dispatched'], closed: [], cancelled: [] }; if (!allowed[order.status].includes(next)) throw new Error(`订单不能从 ${order.status} 变更为 ${next}`); order.status = next; order.version += 1; order.updatedAt = now(); }
+// 状态迁移边界：主链状态单调前进（rank 递增），cancelled 为旁路终态；
+// delivered / closed / cancelled 为终态，任何迟到或重复事件都不得使其倒退。
+const STATUS_RANK: Record<OrderStatus, number> = { draft: 0, confirmed: 1, allocated: 2, dispatched: 3, delivered: 4, closed: 5, cancelled: 6 };
+const TERMINAL_STATUSES: OrderStatus[] = ['delivered', 'closed', 'cancelled'];
+function transition(order: Order, next: OrderStatus) { const allowed: Record<OrderStatus, OrderStatus[]> = { draft: ['confirmed', 'cancelled'], confirmed: ['allocated', 'cancelled'], allocated: ['dispatched', 'cancelled'], dispatched: ['delivered'], delivered: ['closed'], closed: [], cancelled: [] }; if (!allowed[order.status].includes(next)) throw new Error(`订单不能从 ${order.status} 变更为 ${next}`); order.status = next; order.version += 1; order.updatedAt = now(); }
 
 export function listOrders(tenantId: string, filters: { status?: string; customerId?: string; q?: string } = {}) { tenant(tenantId); return state.orders.filter(item => item.tenantId === tenantId && (!filters.status || item.status === filters.status) && (!filters.customerId || item.customerId === filters.customerId) && (!filters.q || `${item.reference} ${item.destination}`.toLowerCase().includes(filters.q.toLowerCase()))).map(clone); }
 export function getOrder(tenantId: string, orderId: string) { return clone(orderFor(tenantId, orderId)); }
@@ -58,16 +67,122 @@ export function createOrder(tenantId: string, input: Partial<Order>, actor = 'sy
 export function confirmOrder(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); const before = clone(order); const customer = customerFor(tenantId, order.customerId); if (customer.blocked) throw new Error('客户已被风控冻结'); if (customer.creditUsed + order.totalAmount > customer.creditLimit) { const approval = createApproval(tenantId, { orderId, type: 'credit_override', reason: '订单金额超过客户授信额度' }, actor); throw new Error(`客户授信不足，需要审批 ${approval.id}`); } transition(order, 'confirmed'); customer.creditUsed = money(customer.creditUsed + order.totalAmount); mutate(tenantId, actor, 'order.confirmed', 'order', order.id, before, order, 'order.confirmed'); return clone(order); }
 export function allocateOrder(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); const before = clone(order); const allocations: Reservation[] = []; for (const item of order.items) { let remaining = item.quantity; for (const lot of state.inventory.filter(value => value.tenantId === tenantId && value.sku === item.sku && value.available - value.reserved > 0)) { const qty = Math.min(remaining, lot.available); lot.reserved += qty; remaining -= qty; allocations.push({ id: id('RSV'), tenantId, orderId, lotId: lot.id, sku: item.sku, quantity: qty, status: 'active', createdAt: now() }); if (!remaining) break; } if (remaining) { for (const allocation of allocations) { const lot = state.inventory.find(value => value.id === allocation.lotId)!; lot.reserved -= allocation.quantity; } throw new Error(`库存不足：${item.sku} 还缺少 ${remaining}`); } } state.reservations.push(...allocations); transition(order, 'allocated'); mutate(tenantId, actor, 'order.allocated', 'order', order.id, before, { order, allocations }, 'inventory.reserved'); return clone(order); }
 export function dispatchOrder(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); const customs = state.customs.find(item => item.orderId === orderId); if (!customs || customs.status !== 'cleared') throw new Error('海关申报尚未放行'); const reservations = state.reservations.filter(item => item.orderId === orderId && item.status === 'active'); if (!reservations.length) throw new Error('订单没有有效库存分配'); const before = clone(order); transition(order, 'dispatched'); reservations.forEach(reservation => { const lot = state.inventory.find(item => item.id === reservation.lotId)!; lot.available -= reservation.quantity; lot.reserved -= reservation.quantity; reservation.status = 'consumed'; }); const shipment: Shipment = { id: id('SHP'), tenantId, orderId, trackingNo: `CBF${Date.now().toString().slice(-8)}`, legs: [{ id: id('LEG'), mode: 'truck', origin: order.origin, destination: '出口口岸', plannedDeparture: now(), plannedArrival: new Date(Date.now() + 86400000).toISOString(), status: 'planned' }, { id: id('LEG'), mode: 'sea', origin: '出口口岸', destination: order.destination, plannedDeparture: new Date(Date.now() + 172800000).toISOString(), plannedArrival: new Date(Date.now() + 10 * 86400000).toISOString(), status: 'planned' }], currentLocation: order.origin, eta: new Date(Date.now() + 10 * 86400000).toISOString(), status: 'planned', events: [] }; state.shipments.push(shipment); order.shipmentId = shipment.id; mutate(tenantId, actor, 'order.dispatched', 'order', order.id, before, { order, shipment }, 'shipment.created'); return clone(order); }
-export function deliverOrder(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); const shipment = state.shipments.find(item => item.orderId === orderId); if (!shipment) throw new Error('运输单不存在'); const before = clone(order); transition(order, 'delivered'); shipment.status = 'delivered'; shipment.currentLocation = order.destination; shipment.events.push({ id: id('TRK'), code: 'DELIVERED', location: order.destination, occurredAt: now(), note: '签收完成' }); mutate(tenantId, actor, 'order.delivered', 'order', order.id, before, { order, shipment }, 'shipment.delivered'); return clone(order); }
-export function closeOrder(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); const invoice = state.invoices.find(item => item.orderId === orderId); if (!invoice || invoice.status !== 'paid') throw new Error('发票未完成收款核销'); const before = clone(order); transition(order, 'closed'); const customer = customerFor(tenantId, order.customerId); customer.creditUsed = money(Math.max(0, customer.creditUsed - order.totalAmount)); mutate(tenantId, actor, 'order.closed', 'order', order.id, before, order, 'order.closed'); return clone(order); }
-export function cancelOrder(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); const before = clone(order); if (['dispatched', 'delivered', 'closed'].includes(order.status)) throw new Error('已出运订单不能取消'); transition(order, 'cancelled'); const reservation = state.reservations.find(item => item.orderId === orderId && item.status === 'active'); if (reservation) { state.inventory.find(lot => lot.id === reservation.lotId)!.reserved -= reservation.quantity; reservation.status = 'released'; } const customer = customerFor(tenantId, order.customerId); if (before.status !== 'draft') customer.creditUsed = money(Math.max(0, customer.creditUsed - order.totalAmount)); mutate(tenantId, actor, 'order.cancelled', 'order', order.id, before, order, 'order.cancelled'); return clone(order); }
+export function deliverOrder(tenantId: string, orderId: string, actor = 'system', options: { occurredAt?: string; note?: string; exception?: boolean } = {}) { const order = orderFor(tenantId, orderId); if (order.status === 'delivered') return clone(order); const shipment = state.shipments.find(item => item.orderId === orderId); if (!shipment) throw new Error('运输单不存在'); const before = clone(order); transition(order, 'delivered'); order.lastEventAt = options.occurredAt ?? now(); shipment.status = options.exception ? 'exception' : 'delivered'; shipment.currentLocation = order.destination; shipment.events.push({ id: id('TRK'), code: options.exception ? 'DELIVERED_EXCEPTION' : 'DELIVERED', location: order.destination, occurredAt: options.occurredAt ?? now(), note: options.note ?? '签收完成' }); mutate(tenantId, actor, 'order.delivered', 'order', order.id, before, { order, shipment }, 'shipment.delivered'); return clone(order); }
+export function closeOrder(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); if (order.status === 'closed') return clone(order); const invoice = state.invoices.find(item => item.orderId === orderId); if (!invoice || invoice.status !== 'paid') throw new Error('发票未完成收款核销'); const before = clone(order); transition(order, 'closed'); const customer = customerFor(tenantId, order.customerId); customer.creditUsed = money(Math.max(0, customer.creditUsed - order.totalAmount)); mutate(tenantId, actor, 'order.closed', 'order', order.id, before, order, 'order.closed'); return clone(order); }
+export function cancelOrder(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); if (order.status === 'cancelled') return clone(order); const before = clone(order); if (['dispatched', 'delivered', 'closed'].includes(order.status)) throw new Error('已出运订单不能取消'); transition(order, 'cancelled'); const reservations = state.reservations.filter(item => item.orderId === orderId && item.status === 'active'); for (const reservation of reservations) { state.inventory.find(lot => lot.id === reservation.lotId)!.reserved -= reservation.quantity; reservation.status = 'released'; } const customer = customerFor(tenantId, order.customerId); if (before.status !== 'draft') customer.creditUsed = money(Math.max(0, customer.creditUsed - order.totalAmount)); mutate(tenantId, actor, 'order.cancelled', 'order', order.id, before, order, 'order.cancelled'); return clone(order); }
+
+// ---------------------------------------------------------------------------
+// 运输链路事件接入（扫描设备 / 承运商 / 人工运营台）
+//
+// 迁移边界由三条判定轴定义，按以下顺序生效：
+// 1. 业务状态：主链状态单调前进（draft < confirmed < allocated < dispatched <
+//    delivered < closed），cancelled 为旁路终态；delivered / closed / cancelled
+//    终态不可被任何事件倒退。
+// 2. 事件时间 occurredAt：早于订单已采纳事件水位 lastEventAt 的事件属于迟到，
+//    只保留原始轨迹与审计，不改写订单状态、不发送状态 outbox。
+// 3. 接收时间 receivedAt：仅用于审计与幂等去重（processedEvents 按 eventId 判重），
+//    不参与状态决策；同一 eventId 重复上传只产生一次业务效果。
+// 迟到 / 重复 / 冲突事件始终写入运输单原始轨迹（shipment.events）与审计日志，
+// 但绝不改写订单状态，也绝不发送新的订单状态 outbox。
+// ---------------------------------------------------------------------------
+const INGEST_CODES: IngestEventCode[] = ['DISPATCHED', 'IN_TRANSIT', 'ARRIVED', 'DELAYED', 'DELIVERED', 'DELIVERED_EXCEPTION', 'CANCELLED'];
+export function ingestOrderEvent(tenantId: string, input: IngestEventInput, actor = 'system'): IngestResult {
+  tenant(tenantId);
+  if (!input.eventId || !input.code || !input.occurredAt) throw new Error('eventId、事件编码与事件时间均不能为空');
+  if (!INGEST_CODES.includes(input.code)) throw new Error(`未知的事件编码：${input.code}`);
+  if (Number.isNaN(Date.parse(input.occurredAt))) throw new Error('事件时间必须是合法时间');
+  const receivedAt = now();
+
+  // 幂等去重：同一 eventId 只处理一次，重复上传按首次结果幂等返回
+  const duplicated = state.processedEvents.find(item => item.tenantId === tenantId && item.eventId === input.eventId);
+  if (duplicated) {
+    const order = state.orders.find(item => item.id === duplicated.orderId)!;
+    return { eventId: input.eventId, status: 'duplicate', reason: `事件已于 ${duplicated.receivedAt} 处理（结果：${duplicated.status}），本次重复上传不产生新的业务效果`, order: clone(order) };
+  }
+
+  const order = input.orderId
+    ? orderFor(tenantId, input.orderId)
+    : (() => { const shipment = state.shipments.find(item => item.tenantId === tenantId && item.trackingNo === input.trackingNo); if (!shipment) throw new Error('无法根据运单号定位订单'); return orderFor(tenantId, shipment.orderId); })();
+  const shipment = state.shipments.find(item => item.orderId === order.id);
+  const finish = (status: IngestResultStatus, reason: string): IngestResult => {
+    state.processedEvents.push({ id: id('PEV'), tenantId, eventId: input.eventId, orderId: order.id, code: input.code, occurredAt: input.occurredAt, receivedAt, status, reason });
+    return { eventId: input.eventId, status, reason, order: clone(order) };
+  };
+  // 原始轨迹：无论事件是否被采纳都保留（重复事件已在上方短路，不会二次写入）
+  const appendRawTrack = () => { if (shipment) shipment.events.push({ id: id('TRK'), code: input.code, location: input.location ?? shipment.currentLocation, occurredAt: input.occurredAt, note: input.note }); };
+  const auditOnly = (action: string, reason: string) => record(tenantId, actor, action, 'order', order.id, { status: order.status }, { event: { ...input, receivedAt }, reason });
+
+  const EVENT_TARGET: Partial<Record<IngestEventCode, OrderStatus>> = { DISPATCHED: 'dispatched', DELIVERED: 'delivered', DELIVERED_EXCEPTION: 'delivered', CANCELLED: 'cancelled' };
+  const target: OrderStatus | undefined = EVENT_TARGET[input.code];
+
+  // 纯轨迹事件（IN_TRANSIT / ARRIVED / DELAYED）：只影响运输单，从不改写订单状态
+  if (!target) {
+    if (TERMINAL_STATUSES.includes(order.status)) {
+      appendRawTrack();
+      const reason = `订单已处于终态 ${order.status}，迟到的 ${input.code} 轨迹仅保留原始记录，不改写订单与运输单状态`;
+      auditOnly('shipment.event.late', reason);
+      return finish('ignored', reason);
+    }
+    if (shipment) addShipmentEvent(tenantId, shipment.id, { code: input.code, location: input.location ?? shipment.currentLocation, occurredAt: input.occurredAt, note: input.note }, actor);
+    return finish('applied', `轨迹事件 ${input.code} 已记录，订单状态保持 ${order.status} 不变`);
+  }
+
+  // 终态保护：区分"互斥冲突"与"迟到/重复终态"，均不改写状态、不发 outbox
+  if (TERMINAL_STATUSES.includes(order.status)) {
+    const isConflict = (order.status === 'cancelled' && (input.code === 'DELIVERED' || input.code === 'DELIVERED_EXCEPTION'))
+      || ((order.status === 'delivered' || order.status === 'closed') && input.code === 'CANCELLED');
+    appendRawTrack();
+    if (isConflict) {
+      const reason = `事件 ${input.code} 与订单当前终态 ${order.status} 互斥（事件时间 ${input.occurredAt}，接收时间 ${receivedAt}），已保留冲突审计，订单状态不变`;
+      auditOnly('order.event.conflict', reason);
+      return finish('conflict', reason);
+    }
+    const reason = order.status === target
+      ? `订单已处于终态 ${order.status}，重复终态事件只保留审计与原始轨迹，不再产生业务效果`
+      : `订单已处于终态 ${order.status}，迟到事件 ${input.code}（事件时间 ${input.occurredAt}）被忽略，订单状态不变`;
+    auditOnly('order.event.ignored', reason);
+    return finish('ignored', reason);
+  }
+
+  // 事件时间水位：早于已采纳事件时间的消息属于迟到
+  if (order.lastEventAt && input.occurredAt < order.lastEventAt) {
+    appendRawTrack();
+    const reason = `事件时间 ${input.occurredAt} 早于订单已采纳事件水位 ${order.lastEventAt}，迟到事件只保留原始轨迹与审计`;
+    auditOnly('order.event.ignored', reason);
+    return finish('ignored', reason);
+  }
+
+  // 状态倒退保护：目标状态必须沿主链前进（cancel 为合法旁路，单独处理）
+  if (target !== 'cancelled' && STATUS_RANK[target] <= STATUS_RANK[order.status]) {
+    appendRawTrack();
+    const reason = `事件 ${input.code} 对应状态 ${target} 不晚于当前状态 ${order.status}，为避免状态倒退已忽略（事件时间 ${input.occurredAt}，接收时间 ${receivedAt}）`;
+    auditOnly('order.event.ignored', reason);
+    return finish('ignored', reason);
+  }
+
+  // 采纳事件：复用既有领域命令，保证库存、授信、运输单等副作用一致
+  try {
+    if (input.code === 'DISPATCHED') dispatchOrder(tenantId, order.id, actor);
+    else if (input.code === 'CANCELLED') cancelOrder(tenantId, order.id, actor);
+    else deliverOrder(tenantId, order.id, actor, { occurredAt: input.occurredAt, note: input.note, exception: input.code === 'DELIVERED_EXCEPTION' });
+  } catch (error) {
+    appendRawTrack();
+    const reason = `事件 ${input.code} 无法应用：${error instanceof Error ? error.message : '未知错误'}，已保留原始轨迹与审计`;
+    auditOnly('order.event.rejected', reason);
+    return finish('rejected', reason);
+  }
+  order.lastEventAt = input.occurredAt;
+  if (input.code === 'DELIVERED_EXCEPTION') record(tenantId, actor, 'order.delivered.exception', 'order', order.id, undefined, { event: { ...input, receivedAt }, note: '异常签收，待人工复核' });
+  const reason = input.code === 'DELIVERED_EXCEPTION' ? '异常签收已采纳：订单进入 delivered，运输单标记异常，等待人工复核' : `事件 ${input.code} 已采纳，订单状态推进为 ${target}`;
+  return finish('applied', reason);
+}
 
 export function createCustomsDeclaration(tenantId: string, input: { orderId: string; country?: string; requiredDocuments?: string[] }, actor = 'system') { const order = orderFor(tenantId, input.orderId); if (state.customs.some(item => item.orderId === order.id)) throw new Error('订单已有海关申报'); const declaration: CustomsDeclaration = { id: id('CUS'), tenantId, orderId: order.id, country: input.country ?? order.destination, status: 'draft', documentRefs: [], requiredDocuments: input.requiredDocuments ?? ['commercial-invoice', 'packing-list', 'origin-certificate'], riskScore: order.priority === 'critical' ? 82 : order.totalWeightKg > 1000 ? 60 : 24, updatedAt: now() }; state.customs.push(declaration); order.customsDeclarationId = declaration.id; mutate(tenantId, actor, 'customs.created', 'customs', declaration.id, undefined, declaration, 'customs.created'); return clone(declaration); }
 export function updateCustoms(tenantId: string, declarationId: string, input: { status?: CustomsStatus; documentRefs?: string[]; rejectionReason?: string }, actor = 'system') { const declaration = assertTenant(state.customs.find(item => item.id === declarationId) ?? (() => { throw new Error('海关申报不存在'); })(), tenantId); const before = clone(declaration); if (input.documentRefs) declaration.documentRefs = [...new Set(input.documentRefs)]; if (input.status) { if (input.status === 'cleared' && declaration.requiredDocuments.some(doc => !declaration.documentRefs.includes(doc))) throw new Error('放行前必须补齐所有必需单证'); if (input.status === 'inspection' && declaration.status !== 'submitted') throw new Error('只有已提交申报才能进入查验'); declaration.status = input.status; } declaration.rejectionReason = input.rejectionReason; declaration.updatedAt = now(); mutate(tenantId, actor, 'customs.updated', 'customs', declaration.id, before, declaration, 'customs.updated'); return clone(declaration); }
 export function addShipmentEvent(tenantId: string, shipmentId: string, input: { code: string; location: string; occurredAt?: string; note?: string }, actor = 'system') { const shipment = assertTenant(state.shipments.find(item => item.id === shipmentId) ?? (() => { throw new Error('运输单不存在'); })(), tenantId); if (!input.code || !input.location) throw new Error('轨迹编码和位置不能为空'); const event = { id: id('TRK'), code: input.code, location: input.location, occurredAt: input.occurredAt ?? now(), note: input.note }; shipment.events.push(event); shipment.currentLocation = input.location; if (input.code === 'DEPARTED') { shipment.status = 'in_transit'; shipment.legs[0].status = 'in_transit'; } if (input.code === 'DELAYED') { shipment.status = 'exception'; shipment.legs.find(leg => leg.status !== 'arrived')!.status = 'delayed'; createApproval(tenantId, { orderId: shipment.orderId, type: 'delay_compensation', reason: `运输轨迹 ${shipment.trackingNo} 发生延误` }, actor); } if (input.code === 'ARRIVED') shipment.legs[shipment.legs.length - 1].status = 'arrived'; record(tenantId, actor, 'shipment.event.added', 'shipment', shipment.id, undefined, event); emit(tenantId, 'shipment.event.added', shipment.id, event); return clone(shipment); }
 
 export function generateInvoice(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); const existing = state.invoices.find(item => item.orderId === orderId); if (existing) return clone(existing); if (!['allocated', 'dispatched', 'delivered', 'closed'].includes(order.status)) throw new Error('订单完成库存分配后才能开票'); const freight = money(Math.max(120, order.totalWeightKg * (order.priority === 'critical' ? 4.2 : 2.1))); const fuel = money(freight * 0.13); const customsFee = money(95 + order.items.length * 25); const lines: InvoiceLine[] = [{ code: 'GOODS', description: '货物服务费', quantity: 1, unitPrice: order.subtotal, amount: order.subtotal }, { code: 'FREIGHT', description: '跨境运输费', quantity: 1, unitPrice: freight, amount: freight }, { code: 'FUEL', description: '燃油附加费', quantity: 1, unitPrice: fuel, amount: fuel }, { code: 'CUSTOMS', description: '关务服务费', quantity: 1, unitPrice: customsFee, amount: customsFee }]; const subtotal = money(lines.reduce((sum, line) => sum + line.amount, 0)); const tax = money(subtotal * 0.06); const invoice: Invoice = { id: id('INV'), tenantId, orderId, number: `INV-${new Date().getFullYear()}-${String(state.invoices.length + 1).padStart(5, '0')}`, status: 'issued', currency: order.currency, lines, subtotal, tax, total: money(subtotal + tax), paid: 0, dueDate: new Date(Date.now() + 30 * 86400000).toISOString(), createdAt: now() }; state.invoices.push(invoice); order.invoiceId = invoice.id; mutate(tenantId, actor, 'invoice.issued', 'invoice', invoice.id, undefined, invoice, 'invoice.issued'); return clone(invoice); }
-export function recordPayment(tenantId: string, input: { invoiceId: string; amount: number; method: Payment['method']; reference: string }, actor = 'system') { const invoice = assertTenant(state.invoices.find(item => item.id === input.invoiceId) ?? (() => { throw new Error('发票不存在'); })(), tenantId); if (!input.amount || input.amount <= 0 || input.amount > invoice.total - invoice.paid + 0.01) throw new Error('收款金额超过发票未核销余额'); const before = clone(invoice); const payment: Payment = { id: id('PAY'), tenantId, invoiceId: invoice.id, amount: money(input.amount), method: input.method, reference: input.reference, receivedAt: now() }; state.payments.push(payment); invoice.paid = money(invoice.paid + payment.amount); invoice.status = invoice.paid >= invoice.total - 0.01 ? 'paid' : 'partially_paid'; if (invoice.status === 'paid') { const order = state.orders.find(item => item.id === invoice.orderId); if (order) order.status = 'closed'; } mutate(tenantId, actor, 'payment.recorded', 'invoice', invoice.id, before, invoice, 'payment.recorded'); return clone(payment); }
+export function recordPayment(tenantId: string, input: { invoiceId: string; amount: number; method: Payment['method']; reference: string }, actor = 'system') { const invoice = assertTenant(state.invoices.find(item => item.id === input.invoiceId) ?? (() => { throw new Error('发票不存在'); })(), tenantId); if (!input.amount || input.amount <= 0 || input.amount > invoice.total - invoice.paid + 0.01) throw new Error('收款金额超过发票未核销余额'); const before = clone(invoice); const payment: Payment = { id: id('PAY'), tenantId, invoiceId: invoice.id, amount: money(input.amount), method: input.method, reference: input.reference, receivedAt: now() }; state.payments.push(payment); invoice.paid = money(invoice.paid + payment.amount); invoice.status = invoice.paid >= invoice.total - 0.01 ? 'paid' : 'partially_paid'; if (invoice.status === 'paid') { const order = state.orders.find(item => item.id === invoice.orderId); if (order && order.status === 'delivered') { const beforeOrder = clone(order); transition(order, 'closed'); const customer = customerFor(tenantId, order.customerId); customer.creditUsed = money(Math.max(0, customer.creditUsed - order.totalAmount)); mutate(tenantId, actor, 'order.closed', 'order', order.id, beforeOrder, order, 'order.closed'); } } mutate(tenantId, actor, 'payment.recorded', 'invoice', invoice.id, before, invoice, 'payment.recorded'); return clone(payment); }
 
 export function createApproval(tenantId: string, input: { orderId: string; type: Approval['type']; reason: string }, actor = 'system') { orderFor(tenantId, input.orderId); const approval: Approval = { id: id('APR'), tenantId, orderId: input.orderId, type: input.type, reason: input.reason, status: 'pending', createdAt: now() }; state.approvals.push(approval); record(tenantId, actor, 'approval.created', 'approval', approval.id, undefined, approval); emit(tenantId, 'approval.created', approval.id, approval); return clone(approval); }
 export function decideApproval(tenantId: string, approvalId: string, input: { status: Exclude<ApprovalStatus, 'pending'>; comment?: string }, actor: string) { const approval = assertTenant(state.approvals.find(item => item.id === approvalId) ?? (() => { throw new Error('审批不存在'); })(), tenantId); if (approval.status !== 'pending') throw new Error('审批已经决策'); const before = clone(approval); approval.status = input.status; approval.decidedBy = actor; approval.comment = input.comment; approval.decidedAt = now(); if (input.status === 'approved' && approval.type === 'credit_override') { const order = orderFor(tenantId, approval.orderId); const customer = customerFor(tenantId, order.customerId); customer.creditLimit = Math.max(customer.creditLimit, customer.creditUsed + order.totalAmount); } mutate(tenantId, actor, 'approval.decided', 'approval', approval.id, before, approval, 'approval.decided'); return clone(approval); }

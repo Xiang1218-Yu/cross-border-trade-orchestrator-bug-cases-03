@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
 import {
-  addShipmentEvent, allocateOrder, cancelOrder, closeOrder, confirmOrder, createApproval, createCustomsDeclaration, createOrder, decideApproval, deliverOrder, dispatchOrder, generateInvoice, getOrder, invoiceOverdue, listAudit, listOrders, listOrdersPage, listOutbox, operationSummary, publishOutbox, recordPayment, state, timeline, updateCustoms
+  addShipmentEvent, allocateOrder, cancelOrder, closeOrder, confirmOrder, createApproval, createCustomsDeclaration, createOrder, decideApproval, deliverOrder, dispatchOrder, generateInvoice, getOrder, ingestOrderEvent, invoiceOverdue, listAudit, listOrders, listOrdersPage, listOutbox, operationSummary, publishOutbox, recordPayment, state, timeline, updateCustoms
 } from './domain.js';
 
 const port = Number(process.env.PORT ?? 4120);
@@ -31,6 +31,9 @@ const server = createServer(async (req, res) => {
     if (method === 'POST' && orderId && path.endsWith('/deliver')) return success(res, deliverOrder(tenant, orderId, user));
     if (method === 'POST' && orderId && path.endsWith('/close')) return success(res, closeOrder(tenant, orderId, user));
     if (method === 'POST' && orderId && path.endsWith('/cancel')) return success(res, cancelOrder(tenant, orderId, user));
+    const orderEventOrderId = path.match(/^\/api\/orders\/([^/]+)\/events$/)?.[1];
+    if (method === 'POST' && orderEventOrderId) { const body = await readBody(req); return success(res, ingestOrderEvent(tenant, { ...body, orderId: orderEventOrderId }, user)); }
+    if (method === 'POST' && path === '/api/tracking/events') return success(res, ingestOrderEvent(tenant, await readBody(req), user));
 
     if (method === 'POST' && path === '/api/customs/declarations') return success(res, createCustomsDeclaration(tenant, await readBody(req), user), 201);
     const customsId = path.match(/^\/api\/customs\/declarations\/([^/]+)$/)?.[1];
